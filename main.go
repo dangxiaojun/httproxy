@@ -66,14 +66,29 @@ func main() {
 			log.Fatalf("connot read access list file: %s", err)
 		}
 		domainsList := strings.Split(string(accessBytes), "\n")
-		for _, v := range domainsList {
+		var errDomain []struct {
+			Lineno  int
+			Pattern string
+			Err     error
+		}
+		for i, v := range domainsList {
 			if reg, err := regexp.Compile(v); err != nil {
-				log.Fatalf("parse pattern [%s] failed: %s", v, err)
+				errDomain = append(errDomain, struct {
+					Lineno  int
+					Pattern string
+					Err     error
+				}{Lineno: i + 1, Pattern: v, Err: err})
 			} else {
 				domains = append(domains, reg)
 			}
 		}
 		f.Close()
+		if len(errDomain) != 0 {
+			for _, v := range errDomain {
+				log.Printf("parse pattern line %d [%s] failed: %s", v.Lineno, v.Pattern, v.Err)
+			}
+			log.Fatalf("parse pattern failed")
+		}
 		if flags.WhiteMode {
 			accessHandle = access(domains, true)
 		} else {
@@ -96,7 +111,6 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-sigCh
-	log.Fatalf("Exit!!!")
 }
 
 func access(domainsRegexp []*regexp.Regexp, mode bool) func(string) bool {
@@ -152,11 +166,11 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 				}
 				defer rc.Close()
 
-				log.Printf("proxy [%s <-> %s <-> %s <-> %s(%s)]",
+				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
 				_, _ = rc.Write(header)
 				if err = relay(c, rc); err != nil {
-					log.Printf("relay error: [%s <-> %s <-> %s <-> %s(%s)]: %s",
+					log.Printf("relay error: %s <-> %s <-> %s <-> %s(%s): %s",
 						c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr(), err)
 				}
 			}()
@@ -167,15 +181,21 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 }
 
 func readHeader(r net.Conn) ([]byte, error) {
+	const bufSize = 1024
 	buf := make([]byte, 16384)
+	offset := 0
 	for {
 		r.SetReadDeadline(time.Now().Add(time.Second * 1))
-		n, err := r.Read(buf)
+		n, err := r.Read(buf[offset : offset+bufSize])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read header failed: %s", err)
 		}
-		return buf[:n], err
+		offset += n
+		if n < bufSize {
+			break
+		}
 	}
+	return buf[:offset], nil
 }
 
 func parseDomainHttp(r net.Conn) (string, []byte, error) {
@@ -225,9 +245,89 @@ func parseDomainHttps(r net.Conn) (string, []byte, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	// TODO parse https header
 
-	return "", header, nil
+	const (
+		DOMAINLEN                   = 256
+		TLSHEADERLEN                = 5
+		FIXEDLENGTHRECORDS          = 38
+		TLSHANDSHAKECONTENTTYPE     = 0x16
+		TLSHANDSHAKETYPECLIENTHELLO = 0x01
+	)
+
+	length := len(header)
+	pos := 0
+	if length < TLSHEADERLEN+FIXEDLENGTHRECORDS {
+		return "", nil, fmt.Errorf("tls header: not enough data")
+	}
+	if int(header[0])&0x80 != 0 && int(header[2]) == 1 {
+		return "", nil, fmt.Errorf("tls header: SSL 2.0, does not support SNI")
+	}
+	if header[0] != TLSHANDSHAKECONTENTTYPE {
+		return "", nil, fmt.Errorf("tls header: tls content type not 0x16")
+	}
+	if header[1] < 3 {
+		return "", nil, fmt.Errorf("tls header: TLS major version < 3, does not support SNI")
+	}
+	recordLen := int(header[3])<<8 + int(header[4]) + TLSHEADERLEN
+	if length < recordLen {
+		return "", nil, fmt.Errorf("tls header: not enough data2")
+	}
+	if header[TLSHEADERLEN] != TLSHANDSHAKETYPECLIENTHELLO {
+		return "", nil, fmt.Errorf("tls header: invalid handshake type")
+	}
+
+	pos += TLSHEADERLEN + FIXEDLENGTHRECORDS
+	// skip session ID
+	if pos+1 > length || pos+1+int(header[pos]) > length {
+		return "", nil, fmt.Errorf("tls header: not enough data3")
+	}
+	pos += 1 + int(header[pos])
+	// skip cipher suites
+	if pos+2 > length || (pos+2+(int(header[pos])<<8)+int(header[pos+1]) > length) {
+		return "", nil, fmt.Errorf("tls header: not enough data4")
+	}
+	pos += 2 + (int(header[pos]) << 8) + int(header[pos+1])
+	// skip compression methods
+	if pos+1 > length || pos+1+int(header[pos]) > length {
+		return "", nil, fmt.Errorf("tls header: not enough data5")
+	}
+	pos += 1 + int(header[pos])
+	// skip extension length
+	if pos+2 > length {
+		return "", nil, fmt.Errorf("tls header: not enough data6")
+	}
+	pos += 2
+
+	// parse extension data
+	for {
+		if pos+4 > recordLen {
+			return "", nil, fmt.Errorf("tls header: buffer more than one record, SNI still not found")
+		}
+		if pos+4 > length {
+			return "", nil, fmt.Errorf("tls header: not enough data7")
+		}
+		extDataLen := (int(header[pos+2]) << 8) + int(header[pos+3])
+		if int(header[pos]) == 0 && int(header[pos+1]) == 0 {
+			// server_name extension type
+			pos += 4
+			if pos+5 > length {
+				return "", nil, fmt.Errorf("tls header: not server_name list header")
+			}
+			serverNameLen := (int(header[pos+3]) << 8) + int(header[pos+4])
+			if pos+5+serverNameLen > length {
+				return "", nil, fmt.Errorf("tls header: not server_name list header")
+			}
+			// return server_name
+			if serverNameLen+1 > DOMAINLEN {
+				return "", nil, fmt.Errorf("tls header: The domain name is too long")
+			}
+			serverName := header[pos+5 : pos+5+serverNameLen]
+			return string(serverName), header, nil
+		} else {
+			// skip
+			pos += 4 + extDataLen
+		}
+	}
 }
 
 func relay(left, right net.Conn) error {
