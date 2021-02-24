@@ -156,7 +156,8 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
 				_, _ = rc.Write(header)
 				if err = relay(c, rc); err != nil {
-					log.Printf("relay error: %s <-> %s, %s", c.RemoteAddr(), remoteAddr, err)
+					log.Printf("relay error: [%s <-> %s <-> %s <-> %s(%s)]: %s",
+						c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr(), err)
 				}
 			}()
 		}
