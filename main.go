@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -143,6 +141,11 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 
 			go func() {
 				defer c.Close()
+				c, ok := c.(*net.TCPConn)
+				if !ok {
+					log.Printf("not a valid tcp socket: %s, close connect", c.RemoteAddr())
+					return
+				}
 				// read domain name
 				domain, header, err := readDomain(c)
 				if err != nil {
@@ -159,7 +162,12 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 					}
 				}
 
-				rc, err := net.DialTimeout("tcp", remoteAddr, time.Second*2)
+				addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+				if err != nil {
+					log.Printf("not a valid address: %s, close connect", remoteAddr)
+					return
+				}
+				rc, err := net.DialTCP("tcp", nil, addr)
 				if err != nil {
 					log.Printf("failed to connect to target %s: %s", remoteAddr, err)
 					return
@@ -169,10 +177,11 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
 				_, _ = rc.Write(header)
-				if err = relay(c, rc); err != nil {
-					log.Printf("relay error: %s <-> %s <-> %s <-> %s(%s): %s",
-						c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr(), err)
-				}
+
+				go func() {
+					pipeThenClose(c, rc)
+				}()
+				pipeThenClose(rc, c)
 			}()
 		}
 	}()
@@ -330,24 +339,31 @@ func parseDomainHttps(r net.Conn) (string, []byte, error) {
 	}
 }
 
-func relay(left, right net.Conn) error {
-	var err, err1 error
-	var wg sync.WaitGroup
-	var wait = 5 * time.Second
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err1 = io.Copy(right, left)
-		right.SetReadDeadline(time.Now().Add(wait)) // unblock read on right
-	}()
-	_, err = io.Copy(left, right)
-	left.SetReadDeadline(time.Now().Add(wait)) // unblock read on left
-	wg.Wait()
-	if err1 != nil && !errors.Is(err1, os.ErrDeadlineExceeded) { // requires Go 1.15+
-		return err1
+// FIXME 断开异常
+func pipeThenClose(r, w *net.TCPConn) {
+	defer w.Close()
+	buf := make([]byte, 2048)
+	for {
+		r.SetNoDelay(true)
+		r.SetReadDeadline(time.Now().Add(time.Second * 2))
+		n, err := r.Read(buf)
+		// read may return EOF with n > 0
+		// should always process n > 0 bytes before handling error
+		if n > 0 {
+			if _, err := w.Write(buf[0:n]); err != nil {
+				log.Println("write:", err)
+				break
+			}
+		}
+
+		if err != nil {
+			/*
+				if err != io.EOF {
+						log.Println("read:", err)
+					}
+			*/
+			break
+		}
 	}
-	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-		return err
-	}
-	return nil
+	return
 }
