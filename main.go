@@ -124,8 +124,14 @@ func access(domainsRegexp []*regexp.Regexp, mode bool) func(string) bool {
 	}
 }
 
-func serve(host, port string, readDomain func(net.Conn) (string, []byte, error), isAccess func(string) bool) error {
-	l, err := net.Listen("tcp", net.JoinHostPort(host, port))
+func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte, error), isAccess func(string) bool) error {
+	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		log.Printf("not a valid bind address: %s", addr)
+		return err
+	}
+
+	l, err := net.ListenTCP("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -133,7 +139,7 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 	log.Printf("listening on %s", net.JoinHostPort(host, port))
 	go func() {
 		for {
-			c, err := l.Accept()
+			c, err := l.AcceptTCP()
 			if err != nil {
 				log.Printf("failed to accept: %s", err)
 				continue
@@ -141,18 +147,12 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 
 			go func() {
 				defer c.Close()
-				c, ok := c.(*net.TCPConn)
-				if !ok {
-					log.Printf("not a valid tcp socket: %s, close connect", c.RemoteAddr())
-					return
-				}
 				// read domain name
-				domain, header, err := readDomain(c)
+				domain, header, err := readDomain(*c)
 				if err != nil {
 					log.Printf("cannot parse domain from [%s]: %s, close connect", c.RemoteAddr(), err)
 					return
 				}
-				remoteAddr := net.JoinHostPort(domain, port)
 
 				// acl
 				if isAccess != nil {
@@ -162,6 +162,7 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 					}
 				}
 
+				remoteAddr := net.JoinHostPort(domain, port)
 				addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
 				if err != nil {
 					log.Printf("not a valid address: %s, close connect", remoteAddr)
@@ -173,6 +174,8 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 					return
 				}
 				defer rc.Close()
+
+				setMark(rc, 100)
 
 				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
@@ -189,7 +192,7 @@ func serve(host, port string, readDomain func(net.Conn) (string, []byte, error),
 	return nil
 }
 
-func readHeader(r net.Conn) ([]byte, error) {
+func readHeader(r net.TCPConn) ([]byte, error) {
 	const bufSize = 1024
 	buf := make([]byte, 16384)
 	offset := 0
@@ -207,7 +210,7 @@ func readHeader(r net.Conn) ([]byte, error) {
 	return buf[:offset], nil
 }
 
-func parseDomainHttp(r net.Conn) (string, []byte, error) {
+func parseDomainHttp(r net.TCPConn) (string, []byte, error) {
 	header, err := readHeader(r)
 	if err != nil {
 		return "", nil, err
@@ -224,7 +227,7 @@ func parseDomainHttp(r net.Conn) (string, []byte, error) {
 	return domain, header, nil
 }
 
-func parseDomainHttps(r net.Conn) (string, []byte, error) {
+func parseDomainHttps(r net.TCPConn) (string, []byte, error) {
 	/* 1   TLS_HANDSHAKE_CONTENT_TYPE
 	 * 1   TLS major version
 	 * 1   TLS minor version
@@ -341,10 +344,9 @@ func parseDomainHttps(r net.Conn) (string, []byte, error) {
 
 // FIXME 断开异常
 func pipeThenClose(r, w *net.TCPConn) {
-	defer w.Close()
 	buf := make([]byte, 2048)
 	for {
-		r.SetNoDelay(true)
+		w.SetNoDelay(true)
 		r.SetReadDeadline(time.Now().Add(time.Second * 2))
 		n, err := r.Read(buf)
 		// read may return EOF with n > 0
