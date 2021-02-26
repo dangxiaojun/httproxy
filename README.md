@@ -5,7 +5,9 @@ supports black and white list
 
 #### USAGE
 ```shell
-httproxy -h 0.0.0.0  -p 80 -t 443 -f access.list -w
+iptables -t nat -A PREROUTING -p tcp -m multiport --dports 443 -m mark --mark 0x0 -j REDIRECT --to-ports 10443
+iptables -t nat -A PREROUTING -p tcp -m multiport --dports 80 -m mark --mark 0x0 -j REDIRECT --to-ports 10080
+httproxy -h 0.0.0.0  -p 10080 -t 10443 -f access.list -w
 ```
 ```shell
 httproxy -help

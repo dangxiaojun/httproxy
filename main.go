@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+const (
+	remoteHttpPort  string = "80"
+	remoteHttpsPort string = "443"
+)
+
 func main() {
 
 	var flags struct {
@@ -99,12 +104,12 @@ func main() {
 	}
 
 	// http
-	if err := serve(flags.BindAddr, flags.HttpPort, parseDomainHttp, accessHandle); err != nil {
+	if err := serve(flags.BindAddr, flags.HttpPort, false, parseDomainHttp, accessHandle); err != nil {
 		log.Fatal(err)
 	}
 
 	// https
-	if err := serve(flags.BindAddr, flags.TlsPort, parseDomainHttps, accessHandle); err != nil {
+	if err := serve(flags.BindAddr, flags.TlsPort, true, parseDomainHttps, accessHandle); err != nil {
 		log.Fatal(err)
 	}
 
@@ -126,7 +131,7 @@ func access(domainsRegexp []*regexp.Regexp, mode bool) func(string) bool {
 	}
 }
 
-func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte, error), isAccess func(string) bool) error {
+func serve(host, port string, tls bool, readDomain func(conn net.TCPConn) (string, []byte, error), isAccess func(string) bool) error {
 	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		log.Printf("not a valid bind address: %s", addr)
@@ -164,7 +169,12 @@ func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte,
 					}
 				}
 
-				remoteAddr := net.JoinHostPort(domain, port)
+				remoteAddr := net.JoinHostPort(domain, func() string {
+					if tls {
+						return remoteHttpsPort
+					}
+					return remoteHttpPort
+				}())
 				addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
 				if err != nil {
 					log.Printf("not a valid address: %s, close connect", remoteAddr)
@@ -181,16 +191,15 @@ func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte,
 
 				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
-				_, err = io.Copy(rc, bytes.NewReader(header))
-				if err != nil && errors.Is(err, os.ErrClosed) {
-					log.Printf("send header error: %s, %s", domain, err)
-					return
-				}
 
 				go func() {
+					defer rc.Close()
+					_, err = io.Copy(rc, bytes.NewReader(header))
+					if err != nil && !errors.Is(err, net.ErrClosed) {
+						log.Printf("send header error: %s, %s", domain, err)
+						return
+					}
 					_, err := io.CopyBuffer(rc, c, make([]byte, 2048))
-					rc.SetDeadline(time.Now()) // wake up the another goroutine blocking on rc
-					c.SetDeadline(time.Now())  // wake up the another goroutine blocking on c
 					if err != nil && !errors.Is(err, net.ErrClosed) {
 						log.Printf("proxy error: %s: %s", domain, err)
 					}
