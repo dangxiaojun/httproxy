@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -179,12 +181,26 @@ func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte,
 
 				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
-				_, _ = rc.Write(header)
+				_, err = io.Copy(rc, bytes.NewReader(header))
+				if err != nil && errors.Is(err, os.ErrClosed) {
+					log.Printf("send header error: %s, %s", domain, err)
+					return
+				}
 
 				go func() {
-					pipeThenClose(c, rc)
+					_, err := io.CopyBuffer(rc, c, make([]byte, 2048))
+					rc.SetDeadline(time.Now()) // wake up the another goroutine blocking on rc
+					c.SetDeadline(time.Now())  // wake up the another goroutine blocking on c
+					if err != nil && !errors.Is(err, net.ErrClosed) {
+						log.Printf("proxy error: %s: %s", domain, err)
+					}
 				}()
-				pipeThenClose(rc, c)
+				_, err = io.CopyBuffer(c, rc, make([]byte, 2048))
+				rc.SetDeadline(time.Now()) // wake up the another goroutine blocking on rc
+				c.SetDeadline(time.Now())  // wake up the another goroutine blocking on c
+				if err != nil && !errors.Is(err, net.ErrClosed) {
+					log.Printf("proxy error: %s: %s", domain, err)
+				}
 			}()
 		}
 	}()
@@ -193,21 +209,12 @@ func serve(host, port string, readDomain func(conn net.TCPConn) (string, []byte,
 }
 
 func readHeader(r net.TCPConn) ([]byte, error) {
-	const bufSize = 1024
 	buf := make([]byte, 16384)
-	offset := 0
-	for {
-		r.SetReadDeadline(time.Now().Add(time.Second * 1))
-		n, err := r.Read(buf[offset : offset+bufSize])
-		if err != nil {
-			return nil, fmt.Errorf("read header failed: %s", err)
-		}
-		offset += n
-		if n < bufSize {
-			break
-		}
+	n, err := r.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read header failed: %s", err)
 	}
-	return buf[:offset], nil
+	return buf[:n], nil
 }
 
 func parseDomainHttp(r net.TCPConn) (string, []byte, error) {
@@ -340,32 +347,4 @@ func parseDomainHttps(r net.TCPConn) (string, []byte, error) {
 			pos += 4 + extDataLen
 		}
 	}
-}
-
-// FIXME 断开异常
-func pipeThenClose(r, w *net.TCPConn) {
-	buf := make([]byte, 2048)
-	for {
-		w.SetNoDelay(true)
-		r.SetReadDeadline(time.Now().Add(time.Second * 2))
-		n, err := r.Read(buf)
-		// read may return EOF with n > 0
-		// should always process n > 0 bytes before handling error
-		if n > 0 {
-			if _, err := w.Write(buf[0:n]); err != nil {
-				log.Println("write:", err)
-				break
-			}
-		}
-
-		if err != nil {
-			/*
-				if err != io.EOF {
-						log.Println("read:", err)
-					}
-			*/
-			break
-		}
-	}
-	return
 }
