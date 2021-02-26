@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
-	"time"
 )
 
 const (
@@ -194,22 +192,29 @@ func serve(host, port string, tls bool, readDomain func(conn net.TCPConn) (strin
 
 				go func() {
 					defer rc.Close()
-					_, err = io.Copy(rc, bytes.NewReader(header))
-					if err != nil && !errors.Is(err, net.ErrClosed) {
-						log.Printf("send header error: %s, %s", domain, err)
-						return
-					}
-					_, err := io.CopyBuffer(rc, c, make([]byte, 2048))
-					if err != nil && !errors.Is(err, net.ErrClosed) {
-						log.Printf("proxy error: %s: %s", domain, err)
-					}
+					io.Copy(rc, bytes.NewReader(header))
+					/*
+						if err != nil && !errors.Is(err, net.ErrClosed) {
+							log.Printf("send header error: %s, %s", domain, err)
+							return
+						}
+					*/
+					io.CopyBuffer(rc, c, make([]byte, 2048))
+					/*
+						    // a lot of "connection reset by peer" caused by normally closing the software
+							if err != nil && !errors.Is(err, net.ErrClosed) {
+									log.Printf("proxy error: %s: %s", domain, err)
+								}
+					*/
+
 				}()
-				_, err = io.CopyBuffer(c, rc, make([]byte, 2048))
-				rc.SetDeadline(time.Now()) // wake up the another goroutine blocking on rc
-				c.SetDeadline(time.Now())  // wake up the another goroutine blocking on c
-				if err != nil && !errors.Is(err, net.ErrClosed) {
-					log.Printf("proxy error: %s: %s", domain, err)
-				}
+				io.CopyBuffer(c, rc, make([]byte, 2048))
+				/*
+					    // a lot of "connection reset by peer" caused by normally closing the software
+						if err != nil && !errors.Is(err, net.ErrClosed) {
+							log.Printf("proxy error: %s: %s", domain, err)
+						}
+				*/
 			}()
 		}
 	}()
