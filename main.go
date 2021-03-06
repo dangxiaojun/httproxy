@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -178,14 +179,26 @@ func serve(host, port string, tls bool, readDomain func(conn net.TCPConn) (strin
 					log.Printf("not a valid address: %s, close connect", remoteAddr)
 					return
 				}
-				rc, err := net.DialTCP("tcp", nil, addr)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				dialer := &net.Dialer{
+					Control: func(_, _ string, c syscall.RawConn) error {
+						return c.Control(func(fd uintptr) {
+							if err := setMark(int(fd), 100); err != nil {
+								log.Printf("dialer set mark error: %s", err)
+								cancel()
+								return
+							}
+						})
+					},
+				}
+
+				rc, err := dialer.DialContext(ctx, "tcp", addr.String())
 				if err != nil {
 					log.Printf("failed to connect to target %s: %s", remoteAddr, err)
 					return
 				}
 				defer rc.Close()
-
-				setMark(rc, 100)
 
 				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
 					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())

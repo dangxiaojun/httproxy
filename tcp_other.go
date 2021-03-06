@@ -2,9 +2,6 @@
 
 package main
 
-import (
-	"net"
-)
-
-func setMark(conn *net.TCPConn, mark int) {
+func setMark(fd int, mark byte) error {
+	return nil
 }
