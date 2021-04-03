@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -21,119 +23,109 @@ const (
 	remoteHttpsPort string = "443"
 )
 
+type (
+	rule struct {
+		Pattern *regexp.Regexp
+		GuiseIP string
+		ReadIP  string
+		Dns     string
+		Mark    string
+		Black   string
+	}
+	errRule struct {
+		Lineno int
+		Raw    string
+		Err    error
+	}
+	readDomainFunc func(*net.TCPConn) (string, []byte, error)
+)
+
+var rules []rule
+var errRules []errRule
+
 func main() {
 
 	var flags struct {
 		BindAddr   string
-		HttpPort   string
-		TlsPort    string
 		AccessFile string
-		WhiteMode  bool
-		BlackMode  bool
-		Help       bool
 	}
-	var domains []*regexp.Regexp
-	var accessHandle func(string) bool
 
-	flag.StringVar(&flags.BindAddr, "h", "0.0.0.0", "bind address")
-	flag.StringVar(&flags.HttpPort, "p", "80", "bind http port")
-	flag.StringVar(&flags.TlsPort, "t", "443", "bind https port")
-	flag.StringVar(&flags.AccessFile, "f", "", "access control rule file")
-	flag.BoolVar(&flags.WhiteMode, "w", false, "run as whitelist mode")
-	flag.BoolVar(&flags.BlackMode, "b", false, "run as blacklist mode")
-	flag.BoolVar(&flags.Help, "help", false, "help")
+	flag.StringVar(&flags.BindAddr, "b", "172.31.255.254:88", "bind address")
+	flag.StringVar(&flags.AccessFile, "f", "access.list", "access control rule file")
 	flag.Parse()
 
 	log.SetPrefix("TRACE ")
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	if flags.Help {
-		flag.Usage()
+	// read domain list
+	f, err := os.OpenFile(flags.AccessFile, os.O_RDONLY, 0600)
+	if err != nil {
+		log.Fatalf("无法读取配置文件: %v", err)
+	}
+	rBuf, err := ioutil.ReadAll(f)
+	if err != nil && err != io.EOF {
+		log.Fatalf("无法读取配置文件: %v", err)
+	}
+	ruleList := strings.Split(string(rBuf), "\n")
+
+	log.Println("开始解析配置文件")
+	for i, v := range ruleList[1:] {
+		if v == "" {
+			continue
+		}
+		elem := strings.Split(v, ",")
+		if len(elem) != 6 {
+			errRules = append(errRules, errRule{
+				Lineno: i + 2,
+				Raw:    v,
+				Err:    fmt.Errorf("该行字段数量不足"),
+			})
+			continue
+		}
+
+		reg, err := regexp.Compile(elem[0])
+		if err != nil {
+			errRules = append(errRules, errRule{
+				Lineno: i + 2,
+				Raw:    v,
+				Err:    err,
+			})
+			continue
+		}
+		rules = append(rules, rule{
+			Pattern: reg,
+			GuiseIP: elem[1],
+			ReadIP:  elem[2],
+			Dns:     elem[3],
+			Mark:    elem[4],
+			Black:   elem[5],
+		})
+
+	}
+	f.Close()
+	if len(errRules) != 0 {
+		for _, v := range errRules {
+			log.Printf("解析规则失败: 第%d行 [%s] 失败原因: %s", v.Lineno, v.Raw, v.Err)
+		}
 		return
 	}
 
-	if flags.WhiteMode && flags.BlackMode {
-		log.Fatalf("cannot running with blacklist mode and whitelist mode, just one")
-	}
-	if flags.WhiteMode || flags.BlackMode {
-		if flags.AccessFile == "" {
-			log.Fatalf("running with blacklist mode or whitelist mode, must need access list file")
+	log.Printf("启动监听 %v", flags.BindAddr)
+	go func() {
+		if err := serve(flags.BindAddr); err != nil {
+			log.Fatal(err)
 		}
-		// read domain list
-		f, err := os.OpenFile(flags.AccessFile, os.O_RDONLY, 0600)
-		if err != nil {
-			log.Fatalf("connot read access list file: %s", err)
-		}
-		accessBytes, err := ioutil.ReadAll(f)
-		if err != nil && err != io.EOF {
-			log.Fatalf("connot read access list file: %s", err)
-		}
-		domainsList := strings.Split(string(accessBytes), "\n")
-		var errDomain []struct {
-			Lineno  int
-			Pattern string
-			Err     error
-		}
-		for i, v := range domainsList {
-			if reg, err := regexp.Compile(v); err != nil {
-				errDomain = append(errDomain, struct {
-					Lineno  int
-					Pattern string
-					Err     error
-				}{Lineno: i + 1, Pattern: v, Err: err})
-			} else {
-				domains = append(domains, reg)
-			}
-		}
-		f.Close()
-		if len(errDomain) != 0 {
-			for _, v := range errDomain {
-				log.Printf("parse pattern line %d [%s] failed: %s", v.Lineno, v.Pattern, v.Err)
-			}
-			log.Fatalf("parse pattern failed")
-		}
-		if flags.WhiteMode {
-			accessHandle = access(domains, true)
-		} else {
-			accessHandle = access(domains, false)
-		}
-	} else {
-		accessHandle = nil
-	}
-
-	// http
-	if err := serve(flags.BindAddr, flags.HttpPort, false, parseDomainHttp, accessHandle); err != nil {
-		log.Fatal(err)
-	}
-
-	// https
-	if err := serve(flags.BindAddr, flags.TlsPort, true, parseDomainHttps, accessHandle); err != nil {
-		log.Fatal(err)
-	}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-sigCh
 }
 
-func access(domainsRegexp []*regexp.Regexp, mode bool) func(string) bool {
-	return func(s string) bool {
-		found := false
-		for _, v := range domainsRegexp {
-			if matched := v.MatchString(s); matched {
-				found = true
-				break
-			}
-		}
-		return found == mode
-	}
-}
-
-func serve(host, port string, tls bool, readDomain func(conn net.TCPConn) (string, []byte, error), isAccess func(string) bool) error {
-	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+func serve(host string) error {
+	addr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
-		log.Printf("not a valid bind address: %s", addr)
 		return err
 	}
 
@@ -142,100 +134,120 @@ func serve(host, port string, tls bool, readDomain func(conn net.TCPConn) (strin
 		return err
 	}
 
-	log.Printf("listening on %s", net.JoinHostPort(host, port))
-	go func() {
-		for {
-			c, err := l.AcceptTCP()
+	for {
+		c, err := l.AcceptTCP()
+		if err != nil {
+			log.Printf("接收链接失败: %s", err)
+			continue
+		}
+
+		go func() {
+			defer c.Close()
+			// 读取起源目标地址
+			dest, err := GetOrigDst(c, false)
 			if err != nil {
-				log.Printf("failed to accept: %s", err)
-				continue
+				log.Printf("从[%s]读取起源地址失败: %s, 关闭链接", c.RemoteAddr(), err)
+				return
+			}
+			destAddr, destPort, err := net.SplitHostPort(dest.String())
+			if err != nil {
+				log.Printf("从起源地址[%s]解析IP与端口失败: %s, 关闭链接", dest, err)
+				return
+			}
+			// read domain name
+			var readDomain readDomainFunc
+			switch destPort {
+			case remoteHttpPort:
+				readDomain = parseDomainHttp
+			case remoteHttpsPort:
+				readDomain = parseDomainHttps
+			default:
+				log.Printf("起源目标端口不是80或者443, 无法确定拆包结构")
+				return
+			}
+			domain, header, err := readDomain(c)
+			ipLink := false
+			if err != nil {
+				if header == nil {
+					log.Printf("读取client hello或者HTTP HOST失败：%s", err)
+					return
+				}
+				ipLink = true
 			}
 
-			go func() {
-				defer c.Close()
-				// read domain name
-				domain, header, err := readDomain(*c)
-				if err != nil {
-					log.Printf("cannot parse domain from [%s]: %s, close connect", c.RemoteAddr(), err)
-					return
-				}
+			remoteAddr := net.JoinHostPort(destAddr, destPort)
+			addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+			if err != nil {
+				log.Printf("目标地址%s不是一个有效得地址, 关闭链接", remoteAddr)
+				return
+			}
 
-				// acl
-				if isAccess != nil {
-					if !isAccess(domain) {
-						log.Printf("disable black domain [%s], close connect", domain)
-						return
-					}
-				}
-
-				remoteAddr := net.JoinHostPort(domain, func() string {
-					if tls {
-						return remoteHttpsPort
-					}
-					return remoteHttpPort
-				}())
-				addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
-				if err != nil {
-					log.Printf("not a valid address: %s, close connect", remoteAddr)
-					return
-				}
-
-				ctx, cancel := context.WithCancel(context.Background())
-				dialer := &net.Dialer{
-					Control: func(_, _ string, c syscall.RawConn) error {
-						return c.Control(func(fd uintptr) {
-							if err := setMark(int(fd), 100); err != nil {
-								log.Printf("dialer set mark error: %s", err)
-								cancel()
-								return
-							}
-						})
-					},
-				}
-
-				rc, err := dialer.DialContext(ctx, "tcp", addr.String())
-				if err != nil {
-					log.Printf("failed to connect to target %s: %s", remoteAddr, err)
-					return
-				}
-				defer rc.Close()
-
-				log.Printf("proxy %s <-> %s <-> %s <-> %s(%s)",
-					c.RemoteAddr(), c.LocalAddr(), rc.LocalAddr(), domain, rc.RemoteAddr())
-
-				go func() {
-					defer rc.Close()
-					io.Copy(rc, bytes.NewReader(header))
-					/*
-						if err != nil && !errors.Is(err, net.ErrClosed) {
-							log.Printf("send header error: %s, %s", domain, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			dialer := &net.Dialer{
+				Control: func(_, _ string, c syscall.RawConn) error {
+					return c.Control(func(fd uintptr) {
+						if err := setMark(int(fd), 100); err != nil {
+							log.Printf("设置标记失败: %s", err)
+							cancel()
 							return
 						}
-					*/
-					io.CopyBuffer(rc, c, make([]byte, 2048))
-					/*
-						    // a lot of "connection reset by peer" caused by normally closing the software
-							if err != nil && !errors.Is(err, net.ErrClosed) {
-									log.Printf("proxy error: %s: %s", domain, err)
-								}
-					*/
+					})
+				},
+			}
 
-				}()
-				io.CopyBuffer(c, rc, make([]byte, 2048))
-				/*
-					    // a lot of "connection reset by peer" caused by normally closing the software
-						if err != nil && !errors.Is(err, net.ErrClosed) {
-							log.Printf("proxy error: %s: %s", domain, err)
-						}
-				*/
-			}()
-		}
+			rc, err := dialer.DialContext(ctx, "tcp", addr.String())
+			if err != nil {
+				log.Printf("链接目标地址失败 %s: %s", remoteAddr, err)
+				return
+			}
+			defer rc.Close()
+
+			switch ipLink {
+			case true:
+				log.Printf("转发 %s <-> %s <-> %s(%s), 该条未读取到域名",
+					c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain)
+			case false:
+				log.Printf("转发 %s <-> %s <-> %s(%s)",
+					c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain)
+			}
+
+			// 发送头部
+			_, err = io.Copy(rc, bytes.NewReader(header))
+			if err != nil && err != net.ErrClosed {
+				log.Printf("转发%s握手出现错误: %v", domain, err)
+			}
+			if err := relay(rc.(*net.TCPConn), c); err != nil {
+				log.Printf("转发%s出现错误: %v", domain, err)
+			}
+		}()
+	}
+}
+
+func relay(left, right *net.TCPConn) error {
+	defer left.Close()
+	defer right.Close()
+	var err error
+	var err1 error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer left.Close()
+		_, err = io.Copy(left, right)
 	}()
+	_, err1 = io.Copy(right, left)
+	wg.Wait()
 
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	if err1 != nil && !errors.Is(err1, net.ErrClosed) {
+		return err1
+	}
 	return nil
 }
 
-func readHeader(r net.TCPConn) ([]byte, error) {
+func readHeader(r *net.TCPConn) ([]byte, error) {
 	buf := make([]byte, 16384)
 	n, err := r.Read(buf)
 	if err != nil {
@@ -244,7 +256,7 @@ func readHeader(r net.TCPConn) ([]byte, error) {
 	return buf[:n], nil
 }
 
-func parseDomainHttp(r net.TCPConn) (string, []byte, error) {
+func parseDomainHttp(r *net.TCPConn) (string, []byte, error) {
 	header, err := readHeader(r)
 	if err != nil {
 		return "", nil, err
@@ -254,14 +266,14 @@ func parseDomainHttp(r net.TCPConn) (string, []byte, error) {
 	reg := regexp.MustCompile(`Host:.*\r\n`)
 	domains := reg.FindAllString(string(header), -1)
 	if domains == nil {
-		return "", nil, fmt.Errorf("not found Host field")
+		return "", header, fmt.Errorf("not found Host field")
 	}
 	domain := strings.TrimRight(strings.Split(domains[0], ":")[1], "\r\n")
 	domain = strings.TrimLeft(domain, " ")
 	return domain, header, nil
 }
 
-func parseDomainHttps(r net.TCPConn) (string, []byte, error) {
+func parseDomainHttps(r *net.TCPConn) (string, []byte, error) {
 	/* 1   TLS_HANDSHAKE_CONTENT_TYPE
 	 * 1   TLS major version
 	 * 1   TLS minor version
@@ -303,69 +315,69 @@ func parseDomainHttps(r net.TCPConn) (string, []byte, error) {
 	length := len(header)
 	pos := 0
 	if length < TLSHEADERLEN+FIXEDLENGTHRECORDS {
-		return "", nil, fmt.Errorf("tls header: not enough data")
+		return "", header, fmt.Errorf("tls header: not enough data")
 	}
 	if int(header[0])&0x80 != 0 && int(header[2]) == 1 {
-		return "", nil, fmt.Errorf("tls header: SSL 2.0, does not support SNI")
+		return "", header, fmt.Errorf("tls header: SSL 2.0, does not support SNI")
 	}
 	if header[0] != TLSHANDSHAKECONTENTTYPE {
-		return "", nil, fmt.Errorf("tls header: tls content type not 0x16")
+		return "", header, fmt.Errorf("tls header: tls content type not 0x16")
 	}
 	if header[1] < 3 {
-		return "", nil, fmt.Errorf("tls header: TLS major version < 3, does not support SNI")
+		return "", header, fmt.Errorf("tls header: TLS major version < 3, does not support SNI")
 	}
 	recordLen := int(header[3])<<8 + int(header[4]) + TLSHEADERLEN
 	if length < recordLen {
-		return "", nil, fmt.Errorf("tls header: not enough data2")
+		return "", header, fmt.Errorf("tls header: not enough data2")
 	}
 	if header[TLSHEADERLEN] != TLSHANDSHAKETYPECLIENTHELLO {
-		return "", nil, fmt.Errorf("tls header: invalid handshake type")
+		return "", header, fmt.Errorf("tls header: invalid handshake type")
 	}
 
 	pos += TLSHEADERLEN + FIXEDLENGTHRECORDS
 	// skip session ID
 	if pos+1 > length || pos+1+int(header[pos]) > length {
-		return "", nil, fmt.Errorf("tls header: not enough data3")
+		return "", header, fmt.Errorf("tls header: not enough data3")
 	}
 	pos += 1 + int(header[pos])
 	// skip cipher suites
 	if pos+2 > length || (pos+2+(int(header[pos])<<8)+int(header[pos+1]) > length) {
-		return "", nil, fmt.Errorf("tls header: not enough data4")
+		return "", header, fmt.Errorf("tls header: not enough data4")
 	}
 	pos += 2 + (int(header[pos]) << 8) + int(header[pos+1])
 	// skip compression methods
 	if pos+1 > length || pos+1+int(header[pos]) > length {
-		return "", nil, fmt.Errorf("tls header: not enough data5")
+		return "", header, fmt.Errorf("tls header: not enough data5")
 	}
 	pos += 1 + int(header[pos])
 	// skip extension length
 	if pos+2 > length {
-		return "", nil, fmt.Errorf("tls header: not enough data6")
+		return "", header, fmt.Errorf("tls header: not enough data6")
 	}
 	pos += 2
 
 	// parse extension data
 	for {
 		if pos+4 > recordLen {
-			return "", nil, fmt.Errorf("tls header: buffer more than one record, SNI still not found")
+			return "", header, fmt.Errorf("tls header: buffer more than one record, SNI still not found")
 		}
 		if pos+4 > length {
-			return "", nil, fmt.Errorf("tls header: not enough data7")
+			return "", header, fmt.Errorf("tls header: not enough data7")
 		}
 		extDataLen := (int(header[pos+2]) << 8) + int(header[pos+3])
 		if int(header[pos]) == 0 && int(header[pos+1]) == 0 {
 			// server_name extension type
 			pos += 4
 			if pos+5 > length {
-				return "", nil, fmt.Errorf("tls header: not server_name list header")
+				return "", header, fmt.Errorf("tls header: not server_name list header")
 			}
 			serverNameLen := (int(header[pos+3]) << 8) + int(header[pos+4])
 			if pos+5+serverNameLen > length {
-				return "", nil, fmt.Errorf("tls header: not server_name list header")
+				return "", header, fmt.Errorf("tls header: not server_name list header")
 			}
 			// return server_name
 			if serverNameLen+1 > DOMAINLEN {
-				return "", nil, fmt.Errorf("tls header: The domain name is too long")
+				return "", header, fmt.Errorf("tls header: The domain name is too long")
 			}
 			serverName := header[pos+5 : pos+5+serverNameLen]
 			return string(serverName), header, nil
