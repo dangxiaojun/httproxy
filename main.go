@@ -6,8 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/dangxiaojun/httproxy/acl"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -16,42 +16,22 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
-
-const (
-	remoteHttpPort  string = "80"
-	remoteHttpsPort string = "443"
-)
-
-type (
-	rule struct {
-		Pattern *regexp.Regexp
-		GuiseIP string
-		ReadIP  string
-		Dns     string
-		Mark    string
-		Black   string
-	}
-	errRule struct {
-		Lineno int
-		Raw    string
-		Err    error
-	}
-	readDomainFunc func(*net.TCPConn) (string, []byte, error)
-)
-
-var rules []rule
-var errRules []errRule
 
 func main() {
 
 	var flags struct {
 		BindAddr   string
 		AccessFile string
+		AclTest    string
+		AclTestIP  string
 	}
 
 	flag.StringVar(&flags.BindAddr, "b", "172.31.255.254:88", "bind address")
-	flag.StringVar(&flags.AccessFile, "f", "access.list", "access control rule file")
+	flag.StringVar(&flags.AccessFile, "f", "", "access control rule file")
+	flag.StringVar(&flags.AclTest, "t", "", "test domain by access rule")
+	flag.StringVar(&flags.AclTestIP, "tip", "", "test domain by access rule")
 	flag.Parse()
 
 	log.SetPrefix("TRACE ")
@@ -59,77 +39,45 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// read domain list
-	f, err := os.OpenFile(flags.AccessFile, os.O_RDONLY, 0600)
-	if err != nil {
-		log.Fatalf("无法读取配置文件: %v", err)
+	if flags.AccessFile != "" {
+		if err := acl.Parse(flags.AccessFile); err != nil {
+			log.Fatalf("解析配置文件出错")
+		}
 	}
-	rBuf, err := ioutil.ReadAll(f)
-	if err != nil && err != io.EOF {
-		log.Fatalf("无法读取配置文件: %v", err)
-	}
-	ruleList := strings.Split(string(rBuf), "\n")
 
-	log.Println("开始解析配置文件")
-	for i, v := range ruleList[1:] {
-		if v == "" {
-			continue
-		}
-		elem := strings.Split(v, ",")
-		if len(elem) != 6 {
-			errRules = append(errRules, errRule{
-				Lineno: i + 2,
-				Raw:    v,
-				Err:    fmt.Errorf("该行字段数量不足"),
-			})
-			continue
-		}
-
-		reg, err := regexp.Compile(elem[0])
-		if err != nil {
-			errRules = append(errRules, errRule{
-				Lineno: i + 2,
-				Raw:    v,
-				Err:    err,
-			})
-			continue
-		}
-		rules = append(rules, rule{
-			Pattern: reg,
-			GuiseIP: elem[1],
-			ReadIP:  elem[2],
-			Dns:     elem[3],
-			Mark:    elem[4],
-			Black:   elem[5],
-		})
-
-	}
-	f.Close()
-	if len(errRules) != 0 {
-		for _, v := range errRules {
-			log.Printf("解析规则失败: 第%d行 [%s] 失败原因: %s", v.Lineno, v.Raw, v.Err)
-		}
+	// test
+	if flags.AclTest != "" {
+		acl.Test(flags.AclTest, flags.AclTestIP)
 		return
 	}
 
-	log.Printf("启动监听 %v", flags.BindAddr)
-	go func() {
-		if err := serve(flags.BindAddr); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	if err := serve(flags.BindAddr); err != nil {
+		log.Fatalf("启动监听失败: %v", err)
+	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
-	<-sigCh
+	for {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt, os.Kill)
+		s := <-sigCh
+		if s != syscall.SIGHUP {
+			break
+		}
+		log.Println("开始重新加载配置文件")
+		if err := acl.Parse(flags.AccessFile); err != nil {
+			log.Printf("重新加载配置文件出错")
+		} else {
+			log.Printf("重新加载配置文件成功, 使用[-t]选项进行新配置测试")
+		}
+	}
 }
 
-func serve(host string) error {
-	addr, err := net.ResolveTCPAddr("tcp", host)
+func serve(addr string) error {
+	a, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return err
 	}
 
-	l, err := net.ListenTCP("tcp", addr)
+	l, err := net.ListenTCP("tcp", a)
 	if err != nil {
 		return err
 	}
@@ -146,81 +94,97 @@ func serve(host string) error {
 			// 读取起源目标地址
 			dest, err := GetOrigDst(c, false)
 			if err != nil {
-				log.Printf("从[%s]读取起源地址失败: %s, 关闭链接", c.RemoteAddr(), err)
+				log.Printf("从[%s]读取起源目标地址失败: %v", c.RemoteAddr(), err)
 				return
 			}
-			destAddr, destPort, err := net.SplitHostPort(dest.String())
+			origDestAddr, origDestPort, err := net.SplitHostPort(dest.String())
 			if err != nil {
-				log.Printf("从起源地址[%s]解析IP与端口失败: %s, 关闭链接", dest, err)
+				log.Printf("从[%s]解析起源地址[%s]失败: %s", c.RemoteAddr(), dest, err)
 				return
 			}
-			// read domain name
-			var readDomain readDomainFunc
-			switch destPort {
-			case remoteHttpPort:
-				readDomain = parseDomainHttp
-			case remoteHttpsPort:
-				readDomain = parseDomainHttps
-			default:
-				log.Printf("起源目标端口不是80或者443, 无法确定拆包结构")
-				return
-			}
-			domain, header, err := readDomain(c)
-			ipLink := false
+
+			domain, header, err := parseDomain(c, origDestPort)
 			if err != nil {
-				if header == nil {
-					log.Printf("读取client hello或者HTTP HOST失败：%s", err)
+				log.Printf("从[%s]读取域名时发生错误: %v", c.RemoteAddr(), err)
+			}
+
+			r := acl.GetReport(domain, origDestAddr)
+			if r.Black {
+				log.Printf("从[%s]转发域名[%s]进入黑名单", c.RemoteAddr(), domain)
+				return
+			}
+			// 域名重解析
+			if r.ReDns != "" {
+				dns := &net.Resolver{
+					PreferGo: true,
+					Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+						d := net.Dialer{
+							Timeout: 10 * time.Second,
+						}
+						return d.DialContext(ctx, "udp", r.ReDns)
+					},
+				}
+				addrs, err := dns.LookupHost(context.Background(), domain)
+				if err != nil {
+					log.Printf("从[%s]转发域名[%s]重新解析DNS失败: %v", c.RemoteAddr(), domain, err)
 					return
 				}
-				ipLink = true
+				if len(addrs) == 0 {
+					log.Printf("从[%s]转发域名[%s]重新解析DNS失败: 没有解析到可用的结果", c.RemoteAddr(), domain)
+					return
+				}
+				r.RedirectAddr = addrs[0]
 			}
 
-			remoteAddr := net.JoinHostPort(destAddr, destPort)
-			addr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+			// relay
+			remoteAddr := net.JoinHostPort(r.RedirectAddr, origDestPort)
+			rc, err := createRemote(remoteAddr, r.Mark)
 			if err != nil {
-				log.Printf("目标地址%s不是一个有效得地址, 关闭链接", remoteAddr)
-				return
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			dialer := &net.Dialer{
-				Control: func(_, _ string, c syscall.RawConn) error {
-					return c.Control(func(fd uintptr) {
-						if err := setMark(int(fd), 100); err != nil {
-							log.Printf("设置标记失败: %s", err)
-							cancel()
-							return
-						}
-					})
-				},
-			}
-
-			rc, err := dialer.DialContext(ctx, "tcp", addr.String())
-			if err != nil {
-				log.Printf("链接目标地址失败 %s: %s", remoteAddr, err)
+				log.Printf("链接目标[%s] > [%s](%s)失败: %v", c.RemoteAddr(), remoteAddr, domain, err)
 				return
 			}
 			defer rc.Close()
 
-			switch ipLink {
-			case true:
-				log.Printf("转发 %s <-> %s <-> %s(%s), 该条未读取到域名",
-					c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain)
-			case false:
-				log.Printf("转发 %s <-> %s <-> %s(%s)",
-					c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain)
-			}
-
-			// 发送头部
+			// relay
+			log.Printf("转发 [%s > %s > %s(%s)]", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain)
 			_, err = io.Copy(rc, bytes.NewReader(header))
 			if err != nil && err != net.ErrClosed {
-				log.Printf("转发%s握手出现错误: %v", domain, err)
+				log.Printf("转发 [%s > %s > %s(%s)] header出现错误: %v", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain, err)
 			}
 			if err := relay(rc.(*net.TCPConn), c); err != nil {
-				log.Printf("转发%s出现错误: %v", domain, err)
+				log.Printf("转发 [%s > %s > %s(%s)] 出现错误: %v", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domain, err)
 			}
 		}()
 	}
+}
+
+func createRemote(addr string, mark int) (net.Conn, error) {
+	a, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("目标地址不是一个有效得地址: %v", err)
+	}
+
+	var errCancel error
+	ctx, cancel := context.WithCancel(context.Background())
+	dialer := &net.Dialer{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark); err != nil {
+					errCancel = err
+					cancel()
+				}
+			})
+		},
+	}
+
+	rc, err := dialer.DialContext(ctx, "tcp", a.String())
+	if errCancel != nil {
+		return nil, fmt.Errorf("设置标记[%d]失败 : %s", mark, errCancel)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rc, nil
 }
 
 func relay(left, right *net.TCPConn) error {
@@ -254,6 +218,17 @@ func readHeader(r *net.TCPConn) ([]byte, error) {
 		return nil, fmt.Errorf("read header failed: %s", err)
 	}
 	return buf[:n], nil
+}
+
+func parseDomain(r *net.TCPConn, port string) (string, []byte, error) {
+	switch port {
+	case "80":
+		return parseDomainHttp(r)
+	case "443":
+		return parseDomainHttps(r)
+	default:
+		return "", nil, nil
+	}
 }
 
 func parseDomainHttp(r *net.TCPConn) (string, []byte, error) {
