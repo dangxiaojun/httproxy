@@ -243,7 +243,7 @@ func parseDomainHttp(r *net.TCPConn) (string, []byte, error, error) {
 	}
 
 	// read all header
-	reg := regexp.MustCompile(`Host:.*\r\n`)
+	reg := regexp.MustCompile(`(?i:host):.*\r\n`)
 	domains := reg.FindAllString(string(header), -1)
 	if domains == nil {
 		return "", header, fmt.Errorf("not found Host field"), nil
