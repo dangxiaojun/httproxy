@@ -232,7 +232,7 @@ func parseDomain(r *net.TCPConn, port string) (string, []byte, error, error) {
 	case "443":
 		return parseDomainHttps(r)
 	default:
-		return "", nil, nil, nil
+		return "", nil, fmt.Errorf("非80，443端口数据"), nil
 	}
 }
 
