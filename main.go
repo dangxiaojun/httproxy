@@ -51,23 +51,24 @@ func main() {
 		return
 	}
 
+	sigCh := make(chan os.Signal, 1)
+	go func() {
+		for {
+			// signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt, os.Kill)
+			signal.Notify(sigCh, syscall.SIGHUP)
+			if s := <-sigCh; s != syscall.SIGHUP {
+				break
+			}
+			if err := acl.Parse(flags.AccessFile); err != nil {
+				log.Printf("重新加载配置文件出错: %v", err)
+			} else {
+				log.Printf("重新加载配置文件成功, 使用[-t]选项进行新配置测试")
+			}
+		}
+	}()
+
 	if err := serve(flags.BindAddr); err != nil {
 		log.Fatalf("启动监听失败: %v", err)
-	}
-
-	for {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt, os.Kill)
-		s := <-sigCh
-		if s != syscall.SIGHUP {
-			break
-		}
-		log.Println("开始重新加载配置文件")
-		if err := acl.Parse(flags.AccessFile); err != nil {
-			log.Printf("重新加载配置文件出错")
-		} else {
-			log.Printf("重新加载配置文件成功, 使用[-t]选项进行新配置测试")
-		}
 	}
 }
 
@@ -115,7 +116,7 @@ func serve(addr string) error {
 
 			r := acl.GetReport(domain, origDestAddr)
 			if r.Black {
-				log.Printf("从[%s]转发域名[%s]进入黑名单", c.RemoteAddr(), domain)
+				log.Printf("从[%s]转发域名[%s]命中黑名单规则，本条链接被阻断", c.RemoteAddr(), domain)
 				return
 			}
 			// 域名重解析

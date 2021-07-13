@@ -102,7 +102,7 @@ func Parse(f string) error {
 			errRules = append(errRules, errRule{
 				Lineno: lineno,
 				Raw:    v,
-				Err:    fmt.Errorf("伪装IP字段不符合IP地址规则: %v", err),
+				Err:    fmt.Errorf("伪装IP字段不符合IP地址规则"),
 			})
 			continue
 		}
@@ -110,7 +110,7 @@ func Parse(f string) error {
 			errRules = append(errRules, errRule{
 				Lineno: lineno,
 				Raw:    v,
-				Err:    fmt.Errorf("转发目标IP字段不符合IP地址规则: %v", err),
+				Err:    fmt.Errorf("转发目标IP字段不符合IP地址规则"),
 			})
 			continue
 		}
@@ -118,7 +118,7 @@ func Parse(f string) error {
 			errRules = append(errRules, errRule{
 				Lineno: lineno,
 				Raw:    v,
-				Err:    fmt.Errorf("重解析dns字段不符合IP地址(ip[:port])规则: %v", err),
+				Err:    fmt.Errorf("重解析dns字段不符合IP地址(ip[:port])规则"),
 			})
 			continue
 		}
@@ -236,5 +236,5 @@ func Test(domain, origDestAddr string) {
 		}
 	}
 
-	log.Printf("[%3d] 未命中任何条目, 将使用默认标记[0x%x]转发本条域名链接至原始地址[%s]", count, DefaultMark, origDestAddr)
+	log.Printf("[%3d] 未命中任何规则条目, 将使用默认标记[0x%x]转发本条域名链接至原始地址[%s]", count, DefaultMark, origDestAddr)
 }
