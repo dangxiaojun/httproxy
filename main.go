@@ -107,7 +107,7 @@ func serve(addr string) error {
 			domain, header, err, err2 := parseDomain(c, origDestPort)
 			domainDetail := domain
 			if err2 != nil {
-				log.Printf("从[%s > %s]读取数据失败: %v", c.RemoteAddr(), dest, err)
+				log.Printf("从[%s > %s]读取数据失败: %v", c.RemoteAddr(), dest, err2)
 				return
 			}
 			if err != nil {
