@@ -19,15 +19,17 @@ import (
 	"time"
 )
 
+var flags struct {
+	BindAddr   string
+	AccessFile string
+	AclTest    string
+	AclTestIP  string
+	RateLimit  int
+}
+
 func main() {
 
-	var flags struct {
-		BindAddr   string
-		AccessFile string
-		AclTest    string
-		AclTestIP  string
-	}
-
+	flag.IntVar(&flags.RateLimit, "r", 0, "rate limit")
 	flag.StringVar(&flags.BindAddr, "b", "172.31.255.254:88", "bind address")
 	flag.StringVar(&flags.AccessFile, "f", "", "access control rule file")
 	flag.StringVar(&flags.AclTest, "t", "", "test domain by access rule")
@@ -78,17 +80,37 @@ func serve(addr string) error {
 		return err
 	}
 
-	l, err := net.ListenTCP("tcp", a)
+	ctx, cancel := context.WithCancel(context.Background())
+	var errCancel error
+	listener := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				if flags.RateLimit > 0 {
+					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, flags.RateLimit); err != nil {
+						errCancel = err
+						cancel()
+					}
+				}
+			})
+		},
+	}
+
+	l, err := listener.Listen(ctx, "tcp", a.String())
 	if err != nil {
+		if errCancel != nil {
+			err = errCancel
+		}
 		return err
 	}
 
 	for {
-		c, err := l.AcceptTCP()
+		conn, err := l.Accept()
 		if err != nil {
 			log.Printf("接收链接失败: %s", err)
 			continue
 		}
+
+		c := conn.(*net.TCPConn)
 
 		go func() {
 			defer c.Close()
@@ -154,6 +176,9 @@ func serve(addr string) error {
 			// relay
 			log.Printf("转发 [%s > %s > %s(%s)]", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domainDetail)
 			_, err = io.Copy(rc, bytes.NewReader(header))
+			if origDestPort == "80" {
+				log.Println(string(header))
+			}
 			if err != nil && err != net.ErrClosed {
 				log.Printf("转发 [%s > %s > %s(%s)] header出现错误: %v", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domainDetail, err)
 			}
@@ -179,15 +204,27 @@ func createRemote(addr string, mark int) (net.Conn, error) {
 					errCancel = err
 					cancel()
 				}
+				// buf实际大小算法， 如果不进行设置，将按照一下两个文件设置buf大小
+				// 从/proc/sys/net/ipv4/tcp_wmem 写缓冲 得到最小值 默认值 最大值
+				// 从/proc/sys/net/ipv4/tcp_rmem 读缓冲 得到最小值 默认值 最大值
+				// (1) val > 最大值sysctl_rmem_max， 则设置为最大值得2倍
+				// (2) val*2 < 最小值，则设置为最小值
+				// (3) val < 最大值sysctl_rmem_max，并且val*2 > 最小值，则设置为val*2
+				if flags.RateLimit > 0 {
+					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, flags.RateLimit); err != nil {
+						errCancel = err
+						cancel()
+					}
+				}
 			})
 		},
 	}
 
 	rc, err := dialer.DialContext(ctx, "tcp", a.String())
-	if errCancel != nil {
-		return nil, fmt.Errorf("设置标记[%d]失败 : %s", mark, errCancel)
-	}
 	if err != nil {
+		if errCancel != nil {
+			err = errCancel
+		}
 		return nil, err
 	}
 	return rc, nil
