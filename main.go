@@ -176,9 +176,6 @@ func serve(addr string) error {
 			// relay
 			log.Printf("转发 [%s > %s > %s(%s)]", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domainDetail)
 			_, err = io.Copy(rc, bytes.NewReader(header))
-			if origDestPort == "80" {
-				log.Println(string(header))
-			}
 			if err != nil && err != net.ErrClosed {
 				log.Printf("转发 [%s > %s > %s(%s)] header出现错误: %v", c.RemoteAddr(), rc.LocalAddr(), rc.RemoteAddr(), domainDetail, err)
 			}
