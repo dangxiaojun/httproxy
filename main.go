@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/dangxiaojun/httproxy/acl"
 	"io"
 	"log"
 	"net"
@@ -42,14 +41,14 @@ func main() {
 
 	// read domain list
 	if flags.AccessFile != "" {
-		if err := acl.Parse(flags.AccessFile); err != nil {
+		if err := Parse(flags.AccessFile); err != nil {
 			log.Fatalf("解析配置文件出错")
 		}
 	}
 
 	// test
 	if flags.AclTest != "" {
-		acl.Test(flags.AclTest, flags.AclTestIP)
+		Test(flags.AclTest, flags.AclTestIP)
 		return
 	}
 
@@ -61,7 +60,7 @@ func main() {
 			if s := <-sigCh; s != syscall.SIGHUP {
 				break
 			}
-			if err := acl.Parse(flags.AccessFile); err != nil {
+			if err := Parse(flags.AccessFile); err != nil {
 				log.Printf("重新加载配置文件出错: %v", err)
 			} else {
 				log.Printf("重新加载配置文件成功, 使用[-t]选项进行新配置测试")
@@ -136,7 +135,7 @@ func serve(addr string) error {
 				domainDetail = fmt.Sprintf("没有读取到域名: %v", err)
 			}
 
-			r := acl.GetReport(domain, origDestAddr)
+			r := GetReport(domain, origDestAddr)
 			if r.Black {
 				log.Printf("从[%s]转发域名[%s]命中黑名单规则，本条链接被阻断", c.RemoteAddr(), domain)
 				return
